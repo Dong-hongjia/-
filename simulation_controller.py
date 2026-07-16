@@ -1,12 +1,14 @@
 import pandas as pd
 import numpy as np
+import networkx as nx
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 # 导入我们之前编写的四大核心模块
 from tle_manager import TLEManager
 from topology_builder import TopologyBuilder
 from routing_engine import RoutingEngine
+from isl_link_model import ISLLinkModel, ISLLinkModelConfig
 
 
 class SimulationController:
@@ -21,16 +23,28 @@ class SimulationController:
                  duration_minutes: float = 10.0,
                  step_seconds: float = 1.0,
                  max_isl_range_km: float = 5000.0,
-                 max_neighbors_per_satellite: int = 6):
+                 max_isl_terminals_per_satellite: int = 4,
+                 max_sgl_terminals_per_satellite: int = 1,
+                 max_sgl_terminals_per_ground_station: int = 2,
+                 isl_range_hysteresis_km: float = 200.0,
+                 sgl_elevation_hysteresis_deg: float = 2.0,
+                 isl_link_model_config: Optional[ISLLinkModelConfig] = None):
         self.tle_file_path = tle_file_path
         self.start_time = start_time_utc
         self.duration_minutes = duration_minutes
         self.step_seconds = step_seconds
         self.max_isl_range_km = max_isl_range_km
-        self.max_neighbors_per_satellite = max_neighbors_per_satellite
+        self.max_isl_terminals_per_satellite = max_isl_terminals_per_satellite
+        self.max_sgl_terminals_per_satellite = max_sgl_terminals_per_satellite
+        self.max_sgl_terminals_per_ground_station = max_sgl_terminals_per_ground_station
+        self.isl_range_hysteresis_km = isl_range_hysteresis_km
+        self.sgl_elevation_hysteresis_deg = sgl_elevation_hysteresis_deg
+        self.isl_link_model = ISLLinkModel(isl_link_model_config)
 
         self.trajectories: Dict[str, pd.DataFrame] = {}
         self.time_index: List[datetime] = []
+        self.previous_topology: Optional[nx.Graph] = None
+        self._isl_model_activation_printed = False
 
         # 全局注册的固定地面节点 (TN)
         self.ground_stations = {
@@ -40,9 +54,46 @@ class SimulationController:
         # 【第一步新增】：为每颗卫星维护当前电量 (满电为 100.0)
         self.battery_states: Dict[str, float] = {}
 
+    def reset_topology_state(self) -> None:
+        """清除上一帧拓扑，用于开始新仿真或播放重置。"""
+        self.previous_topology = None
+        self._isl_model_activation_printed = False
+
+    def build_topology(self, snapshot_df: pd.DataFrame) -> nx.Graph:
+        """构建带终端约束和链路滞回的拓扑，并保存为下一帧的参考状态。"""
+        graph = TopologyBuilder.build_snapshot_graph(
+            snapshot_df,
+            self.max_isl_range_km,
+            ground_stations=self.ground_stations,
+            min_elevation_deg=15.0,
+            max_isl_terminals_per_satellite=self.max_isl_terminals_per_satellite,
+            max_sgl_terminals_per_satellite=self.max_sgl_terminals_per_satellite,
+            max_sgl_terminals_per_ground_station=self.max_sgl_terminals_per_ground_station,
+            previous_graph=self.previous_topology,
+            isl_range_hysteresis_km=self.isl_range_hysteresis_km,
+            sgl_elevation_hysteresis_deg=self.sgl_elevation_hysteresis_deg
+        )
+        # 拓扑层只决定链路是否具备建链资格；此处仅评估 ISL 的网络层代理指标。
+        # SGL 边不会被 ISLLinkModel 修改。
+        self.isl_link_model.apply_to_graph(graph)
+
+        if not self._isl_model_activation_printed:
+            stats = self.isl_link_model.summarize_graph(graph)
+            print(
+                "[+] ISL 近似链路模型已生效: "
+                f"评估 {stats['total']} 条 ISL "
+                f"(UP={stats['up']}, DEGRADED={stats['degraded']}, DOWN={stats['down']})"
+            )
+            self._isl_model_activation_printed = True
+
+        self.previous_topology = graph
+        return graph
+
     def setup_environment(self, max_satellites: int = 50) -> List[str]:
         print("\n=== [阶段 1] 环境初始化与轨道预计算 ===")
         print(f"[*] 正在读取本地 TLE 数据: {self.tle_file_path}")
+        print(f"[*] ISL 近似链路模型: {self.isl_link_model.configuration_summary()}")
+        print("[*] 模型边界: 仅评估星间链路，星地链路保持原有几何拓扑逻辑。")
 
         manager = TLEManager(self.tle_file_path)
         all_sats = manager.get_satellite_names()
@@ -139,6 +190,7 @@ class SimulationController:
 
         results_log = []
         last_path = None
+        self.reset_topology_state()
 
         for step, current_time in enumerate(self.time_index):
             time_str = current_time.strftime("%H:%M:%S")
@@ -147,13 +199,8 @@ class SimulationController:
             # 2. 【电量模型接管】：过滤掉被“饿死”的宕机卫星
             snapshot_df = self.process_battery_model(snapshot_df, current_time)
 
-            graph = TopologyBuilder.build_snapshot_graph(
-                snapshot_df,
-                self.max_isl_range_km,
-                ground_stations=self.ground_stations,
-                min_elevation_deg=15.0,
-                max_neighbors_per_satellite=self.max_neighbors_per_satellite
-            )
+            graph = self.build_topology(snapshot_df)
+            isl_stats = self.isl_link_model.summarize_graph(graph)
 
             if strategy == "shortest_distance":
                 route_res = RoutingEngine.calculate_shortest_distance_path(graph, source_node, target_node)
@@ -178,12 +225,30 @@ class SimulationController:
                 # 顺便抽查一颗存活卫星的电量看看
                 sample_sat = snapshot_df.index[1] if not snapshot_df.empty else "N/A"
                 batt_info = f"| 抽查 {sample_sat} 电量: {self.battery_states.get(sample_sat, 0):.1f}%"
+                model_info = (
+                    f"| ISL状态 UP/DEG/DOWN: {isl_stats['up']}/"
+                    f"{isl_stats['degraded']}/{isl_stats['down']}"
+                )
 
                 if route_res['success']:
+                    bottleneck = route_res['isl_bottleneck_capacity_gbps']
+                    bottleneck_info = (
+                        f"{bottleneck:.2f}Gbps" if bottleneck is not None else "N/A"
+                    )
                     print(
-                        f"[{time_str}] {status_tag} {event_mark} | 延迟: {route_res['propagation_delay_ms']:>6.2f}ms | 跳数: {route_res['hops']} {batt_info}")
+                        f"[{time_str}] {status_tag} {event_mark} "
+                        f"| 传播时延: {route_res['propagation_delay_ms']:>6.2f}ms "
+                        f"| 估算总时延: {route_res['total_delay_ms']:>6.2f}ms "
+                        f"| 跳数: {route_res['hops']} (ISL {route_res['isl_hops']}) "
+                        f"| ISL瓶颈: {bottleneck_info} "
+                        f"| 期望丢包: {route_res['expected_packet_loss_rate']:.3e} "
+                        f"{model_info} {batt_info}"
+                    )
                 else:
-                    print(f"[{time_str}] {status_tag} {event_mark} | 网络不可达 (割裂)! {batt_info}")
+                    print(
+                        f"[{time_str}] {status_tag} {event_mark} "
+                        f"| 网络不可达 (割裂)! {model_info} {batt_info}"
+                    )
 
             results_log.append({
                 'timestamp': current_time,
@@ -192,6 +257,11 @@ class SimulationController:
                 'hops': route_res['hops'] if route_res['success'] else np.nan,
                 'distance_km': route_res['total_distance_km'] if route_res['success'] else np.nan,
                 'delay_ms': route_res['propagation_delay_ms'] if route_res['success'] else np.nan,
+                'total_delay_ms': route_res['total_delay_ms'] if route_res['success'] else np.nan,
+                'isl_hops': route_res['isl_hops'] if route_res['success'] else np.nan,
+                'isl_bottleneck_capacity_gbps': route_res['isl_bottleneck_capacity_gbps'] if route_res['success'] else np.nan,
+                'expected_packet_loss_rate': route_res['expected_packet_loss_rate'] if route_res['success'] else np.nan,
+                'min_proxy_margin_db': route_res['min_proxy_margin_db'] if route_res['success'] else np.nan,
                 'path_str': ' -> '.join(route_res['path']) if route_res['success'] else ""
             })
 
@@ -273,6 +343,31 @@ class SimulationController:
             print("\n[3] 拓扑与路由稳定性 (Routing Stability)")
             print("    - 警告: 仿真期间网络从未连通，无路由数据。")
 
+        # 4. ISL 确定性代理链路模型结果（SGL 不在本节统计范围内）
+        if not connected_df.empty and 'isl_bottleneck_capacity_gbps' in connected_df:
+            isl_route_df = connected_df[connected_df['isl_hops'] > 0]
+            print("\n[4] ISL 近似链路模型 (Deterministic Proxy)")
+            if not isl_route_df.empty:
+                print(
+                    f"    - 平均估算总时延: "
+                    f"{isl_route_df['total_delay_ms'].mean():.2f} ms"
+                )
+                print(
+                    f"    - 平均瓶颈容量:   "
+                    f"{isl_route_df['isl_bottleneck_capacity_gbps'].mean():.2f} Gbps"
+                )
+                print(
+                    f"    - 平均期望丢包率: "
+                    f"{isl_route_df['expected_packet_loss_rate'].mean():.3e}"
+                )
+                print(
+                    f"    - 最低代理裕量:   "
+                    f"{isl_route_df['min_proxy_margin_db'].min():.2f} dB"
+                )
+                print("    - 说明: 以上为 ISL 网络层代理指标，不是真实激光信道测量值。")
+            else:
+                print("    - 当前成功路径不包含 ISL，暂无代理链路指标。")
+
         print("==================================================\n")
 
 
@@ -291,10 +386,14 @@ if __name__ == "__main__":
         controller = SimulationController(
             tle_file_path=REAL_TLE_FILE,
             start_time_utc=sim_start,
-            duration_minutes=60.0, #min
+            duration_minutes=20.0, #min
             step_seconds=1.0,  #s
-            max_isl_range_km=6000.0,  #链路最大长度
-            max_neighbors_per_satellite=6
+            max_isl_range_km=6000.0,  # 链路最大建立距离
+            max_isl_terminals_per_satellite=4,
+            max_sgl_terminals_per_satellite=1,
+            max_sgl_terminals_per_ground_station=2,
+            isl_range_hysteresis_km=200.0,
+            sgl_elevation_hysteresis_deg=2.0
         )
 
         active_nodes = controller.setup_environment(max_satellites=50)

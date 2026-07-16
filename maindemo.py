@@ -10,7 +10,6 @@ import pandas as pd
 # 导入我们之前编写的核心计算模块
 # 请确保 tle_manager.py, topology_builder.py, routing_engine.py, simulation_controller.py 都在同级目录
 from simulation_controller import SimulationController
-from topology_builder import TopologyBuilder
 from routing_engine import RoutingEngine
 
 # app = FastAPI(title="NTN-TN Simulation API")
@@ -410,7 +409,11 @@ async def simulation_endpoint(websocket: WebSocket):
             duration_minutes=20,
             step_seconds=1.0,
             max_isl_range_km=5000.0,
-            max_neighbors_per_satellite=6
+            max_isl_terminals_per_satellite=4,
+            max_sgl_terminals_per_satellite=1,
+            max_sgl_terminals_per_ground_station=2,
+            isl_range_hysteresis_km=200.0,
+            sgl_elevation_hysteresis_deg=2.0
         )
 
         active_sats = controller.setup_environment(max_satellites=50)
@@ -444,12 +447,11 @@ async def simulation_endpoint(websocket: WebSocket):
             current_idx = sim_state["step_idx"]
             current_time = controller.time_index[current_idx]
 
+            if current_idx == 0:
+                controller.reset_topology_state()
+
             snapshot_df = controller._get_snapshot(current_time)
-            graph = TopologyBuilder.build_snapshot_graph(
-                snapshot_df,
-                controller.max_isl_range_km,
-                max_neighbors_per_satellite=controller.max_neighbors_per_satellite
-            )
+            graph = controller.build_topology(snapshot_df)
 
             src_node = sim_state["src_node"]
             dst_node = sim_state["dst_node"]
@@ -477,7 +479,11 @@ async def simulation_endpoint(websocket: WebSocket):
                     "success": route_res['success'],
                     "path": route_res['path'] if route_res['success'] else [],
                     "delay_ms": round(route_res['propagation_delay_ms'], 2) if route_res['success'] else 0.0,
-                    "hops": route_res['hops'] if route_res['success'] else 0
+                    "total_delay_ms": round(route_res['total_delay_ms'], 2) if route_res['success'] else 0.0,
+                    "hops": route_res['hops'] if route_res['success'] else 0,
+                    "isl_hops": route_res['isl_hops'] if route_res['success'] else 0,
+                    "isl_bottleneck_capacity_gbps": route_res['isl_bottleneck_capacity_gbps'] if route_res['success'] else None,
+                    "expected_packet_loss_rate": route_res['expected_packet_loss_rate'] if route_res['success'] else None
                 }
             }
 

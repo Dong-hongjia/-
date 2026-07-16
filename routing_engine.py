@@ -51,6 +51,11 @@ class RoutingEngine:
             'hops': 0,
             'total_distance_km': 0.0,
             'propagation_delay_ms': 0.0,
+            'total_delay_ms': 0.0,
+            'isl_hops': 0,
+            'isl_bottleneck_capacity_gbps': None,
+            'expected_packet_loss_rate': 0.0,
+            'min_proxy_margin_db': None,
             'error_msg': ""
         }
 
@@ -60,11 +65,28 @@ class RoutingEngine:
             return result
 
         try:
+            # ISL 代理模型判定为 DOWN 的边仍保留在物理拓扑中用于观测，
+            # 但不能参与路由；未建模的 SGL 默认保持可路由。
+            routable_graph = nx.subgraph_view(
+                graph,
+                filter_edge=lambda u, v: graph.get_edge_data(u, v).get('routable', True)
+            )
+
             # 2. 执行网络寻路算法 (底层依据 weight_attr 是否为 None 自动选择算法)
-            path = nx.shortest_path(graph, source=source, target=target, weight=weight_attr)
+            path = nx.shortest_path(
+                routable_graph,
+                source=source,
+                target=target,
+                weight=weight_attr
+            )
 
             # 3. 统计路由关键指标 (QoS)
             total_distance = 0.0
+            total_delay_ms = 0.0
+            isl_hops = 0
+            isl_capacities = []
+            isl_margins = []
+            expected_delivery_probability = 1.0
 
             # 遍历路径中的每一跳，累加物理距离
             for i in range(len(path) - 1):
@@ -72,7 +94,23 @@ class RoutingEngine:
                 v = path[i + 1]
                 # 获取图中该边的属性字典
                 edge_data = graph.get_edge_data(u, v)
-                total_distance += edge_data.get('distance_km', 0.0)
+                edge_distance = float(edge_data.get('distance_km', 0.0))
+                edge_propagation_delay_ms = (
+                    edge_distance / cls.SPEED_OF_LIGHT_KM_S
+                ) * 1000.0
+                total_distance += edge_distance
+
+                if edge_data.get('type') == 'ISL' and 'link_model' in edge_data:
+                    isl_hops += 1
+                    isl_capacities.append(float(edge_data['capacity_gbps']))
+                    isl_margins.append(float(edge_data['proxy_margin_db']))
+                    expected_delivery_probability *= (
+                        1.0 - float(edge_data['expected_packet_loss_rate'])
+                    )
+                    total_delay_ms += float(edge_data['total_delay_ms'])
+                else:
+                    # SGL 暂不建模，继续沿用原有的纯传播时延，不附加容量或丢包假设。
+                    total_delay_ms += edge_propagation_delay_ms
 
             # 计算传播时延 (毫秒)
             delay_ms = (total_distance / cls.SPEED_OF_LIGHT_KM_S) * 1000.0
@@ -83,9 +121,18 @@ class RoutingEngine:
             result['hops'] = len(path) - 1  # 3个节点构成的路径是 2 跳
             result['total_distance_km'] = total_distance
             result['propagation_delay_ms'] = delay_ms
+            result['total_delay_ms'] = total_delay_ms
+            result['isl_hops'] = isl_hops
+            result['isl_bottleneck_capacity_gbps'] = (
+                min(isl_capacities) if isl_capacities else None
+            )
+            result['expected_packet_loss_rate'] = (
+                1.0 - expected_delivery_probability if isl_hops > 0 else 0.0
+            )
+            result['min_proxy_margin_db'] = min(isl_margins) if isl_margins else None
 
         except nx.NetworkXNoPath:
-            result['error_msg'] = f"路由失败: '{source}' 到 '{target}' 之间无物理连通路径 (网络割裂)。"
+            result['error_msg'] = f"路由失败: '{source}' 到 '{target}' 之间无可路由连通路径 (网络割裂或 ISL 不可用)。"
         except Exception as e:
             result['error_msg'] = f"路由计算发生未知错误: {str(e)}"
 
